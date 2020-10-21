@@ -3,7 +3,7 @@ environment:
 
 install:
   - ps: Install-Product node $env:nodejs_version x64
-  - yarn
+  - yarn --frozen-lockfile
 
 test_script:
   - git --version
@@ -11,7 +11,6 @@ test_script:
   - yarn --version
   - yarn build
   - yarn test
-  - yarn test-sw
 
 cache:
   - node_modules -> yarn.lock

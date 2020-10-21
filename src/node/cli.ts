@@ -10,8 +10,12 @@ if (argv.debug) {
 }
 
 import os from 'os'
+import path from 'path'
 import chalk from 'chalk'
 import { UserConfig, resolveConfig } from './config'
+
+const command = argv._[0]
+const defaultMode = command === 'build' ? 'production' : 'development'
 
 function logHelp() {
   console.log(`
@@ -26,7 +30,6 @@ Options:
   --help, -h                 [boolean] show help
   --version, -v              [boolean] show version
   --config, -c               [string]  use specified config file
-  --serviceWorker, -sw       [boolean] configure service worker caching (default: false)
   --port                     [number]  port to use for serve
   --open                     [boolean] open browser on server start
   --base                     [string]  public base path for build (default: /)
@@ -36,24 +39,30 @@ Options:
   --sourcemap                [boolean] output source maps for build (default: false)
   --minify                   [boolean | 'terser' | 'esbuild'] enable/disable minification, or specify
                                        minifier to use. (default: 'terser')
+  --mode, -m                 [string]  specify env mode (default: 'development' for dev, 'production' for build)
   --ssr                      [boolean] build for server-side rendering
   --jsx                      ['vue' | 'preact' | 'react']  choose jsx preset (default: 'vue')
   --jsx-factory              [string]  (default: React.createElement)
   --jsx-fragment             [string]  (default: React.Fragment)
+  --force                    [boolean] force the optimizer to ignore the cache and re-bundle
 `)
 }
 
-console.log(chalk.cyan(`vite v${require('../package.json').version}`))
+console.log(chalk.cyan(`vite v${require('../../package.json').version}`))
 ;(async () => {
-  if (argv.help || argv.h) {
+  const { help, h, mode, m, version, v } = argv
+
+  if (help || h) {
     logHelp()
     return
-  } else if (argv.version || argv.v) {
+  } else if (version || v) {
     // noop, already logged
     return
   }
 
-  const options = await resolveOptions()
+  const envMode = mode || m || defaultMode
+  const options = await resolveOptions(envMode)
+  process.env.NODE_ENV = process.env.NODE_ENV || envMode
   if (!options.command || options.command === 'serve') {
     runServe(options)
   } else if (options.command === 'build') {
@@ -66,11 +75,9 @@ console.log(chalk.cyan(`vite v${require('../package.json').version}`))
   }
 })()
 
-async function resolveOptions() {
-  // shorthand for serviceWorker option
-  if (argv['sw']) {
-    argv.serviceWorker = argv['sw']
-  }
+async function resolveOptions(mode: string) {
+  // specify env mode
+  argv.mode = mode
   // map jsx args
   if (argv['jsx-factory']) {
     ;(argv.jsx || (argv.jsx = {})).factory = argv['jsx-factory']
@@ -93,29 +100,41 @@ async function resolveOptions() {
   }
   // normalize root
   // assumes all commands are in the form of `vite [command] [root]`
-  if (argv._[1] && !argv.root) {
+  if (!argv.root && argv._[1]) {
     argv.root = argv._[1]
   }
 
-  const userConfig = await resolveConfig(argv.config || argv.c)
+  if (argv.root) {
+    argv.root = path.isAbsolute(argv.root) ? argv.root : path.resolve(argv.root)
+  }
+
+  const userConfig = await resolveConfig(mode, argv.config || argv.c)
   if (userConfig) {
     return {
       ...userConfig,
       ...argv // cli options take higher priority
     }
   }
+
+  // deprecation warning
+  if (argv.sw || argv.serviceWorker) {
+    console.warn(
+      chalk.yellow(
+        `[vite] service worker mode has been removed due to insufficient performance gains.`
+      )
+    )
+  }
+
   return argv
 }
 
-async function runServe(
-  options: UserConfig & {
-    port?: number
-    open?: boolean
-  }
-) {
-  const server = require('../dist').createServer(options)
+function runServe(options: UserConfig) {
+  const server = require('./server').createServer(options)
 
   let port = options.port || 3000
+  let hostname = options.hostname || 'localhost'
+  const protocol = options.https ? 'https' : 'http'
+
   server.on('error', (e: Error & { code?: string }) => {
     if (e.code === 'EADDRINUSE') {
       console.log(`Port ${port} is in use, trying another one...`)
@@ -141,11 +160,11 @@ async function runServe(
             type: detail.address.includes('127.0.0.1')
               ? 'Local:   '
               : 'Network: ',
-            host: detail.address.replace('127.0.0.1', 'localhost')
+            host: detail.address.replace('127.0.0.1', hostname)
           }
         })
         .forEach(({ type, host }) => {
-          const url = `http://${host}:${chalk.bold(port)}/`
+          const url = `${protocol}://${host}:${chalk.bold(port)}/`
           console.log(`  > ${type} ${chalk.cyan(url)}`)
         })
     })
@@ -153,14 +172,16 @@ async function runServe(
     require('debug')('vite:server')(`server ready in ${Date.now() - start}ms.`)
 
     if (options.open) {
-      require('./utils/openBrowser').openBrowser(`http://localhost:${port}`)
+      require('./utils/openBrowser').openBrowser(
+        `${protocol}://${hostname}:${port}`
+      )
     }
   })
 }
 
 async function runBuild(options: UserConfig) {
   try {
-    await require('../dist').build(options)
+    await require('./build')[options.ssr ? 'ssrBuild' : 'build'](options)
     process.exit(0)
   } catch (err) {
     console.error(chalk.red(`[vite] Build errored out.`))
@@ -171,7 +192,10 @@ async function runBuild(options: UserConfig) {
 
 async function runOptimize(options: UserConfig) {
   try {
-    await require('../dist').optimizeDeps(options, true /* as cli command */)
+    await require('./optimizer').optimizeDeps(
+      options,
+      true /* as cli command */
+    )
     process.exit(0)
   } catch (err) {
     console.error(chalk.red(`[vite] Dep optimization errored out.`))

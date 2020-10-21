@@ -1,45 +1,47 @@
 import path from 'path'
 import fs from 'fs-extra'
 import LRUCache from 'lru-cache'
-import { Context } from 'koa'
+import { Context } from '../server'
 import { Readable } from 'stream'
 import { seenUrls } from '../server/serverPluginServeStatic'
+import mime from 'mime-types'
+import { HMRWatcher } from '../server/serverPluginHmr'
 
 const getETag = require('etag')
 
 interface CacheEntry {
   lastModified: number
   etag: string
-  content: string
+  content: Buffer
 }
 
-const moduleReadCache = new LRUCache<string, CacheEntry>({
+const fsReadCache = new LRUCache<string, CacheEntry>({
   max: 10000
 })
 
 /**
  * Read a file with in-memory cache.
- * Also sets approrpriate headers and body on the Koa context.
+ * Also sets appropriate headers and body on the Koa context.
+ * This is exposed on middleware context as `ctx.read` with the `ctx` already
+ * bound, so it can be used as `ctx.read(file)`.
  */
 export async function cachedRead(
   ctx: Context | null,
   file: string
-): Promise<string> {
+): Promise<Buffer> {
   const lastModified = fs.statSync(file).mtimeMs
-  const cached = moduleReadCache.get(file)
+  const cached = fsReadCache.get(file)
   if (ctx) {
     ctx.set('Cache-Control', 'no-cache')
-    ctx.type = path.basename(file)
+    ctx.type = mime.lookup(path.extname(file)) || 'application/octet-stream'
   }
   if (cached && cached.lastModified === lastModified) {
     if (ctx) {
+      // a private marker in case the user ticks "disable cache" during dev
+      ctx.__notModified = true
       ctx.etag = cached.etag
       ctx.lastModified = new Date(cached.lastModified)
-      if (
-        ctx.__serviceWorker !== true &&
-        ctx.get('If-None-Match') === ctx.etag &&
-        seenUrls.has(ctx.url)
-      ) {
+      if (ctx.get('If-None-Match') === ctx.etag && seenUrls.has(ctx.url)) {
         ctx.status = 304
       }
       seenUrls.add(ctx.url)
@@ -47,9 +49,10 @@ export async function cachedRead(
     }
     return cached.content
   }
-  const content = await fs.readFile(file, 'utf-8')
+  // #395 some file is an binary file, eg. font
+  const content = await fs.readFile(file)
   const etag = getETag(content)
-  moduleReadCache.set(file, {
+  fsReadCache.set(file, {
     content,
     etag,
     lastModified
@@ -59,6 +62,10 @@ export async function cachedRead(
     ctx.lastModified = new Date(lastModified)
     ctx.body = content
     ctx.status = 200
+
+    // watch the file if it's out of root.
+    const { root, watcher } = ctx
+    watchFileIfOutOfRoot(watcher, root, file)
   }
   return content
 }
@@ -85,15 +92,33 @@ export async function readBody(
   }
 }
 
-export function lookupFile(dir: string, formats: string[]): string | undefined {
+export function lookupFile(
+  dir: string,
+  formats: string[],
+  pathOnly = false
+): string | undefined {
   for (const format of formats) {
     const fullPath = path.join(dir, format)
-    if (fs.existsSync(fullPath)) {
-      return fs.readFileSync(fullPath, 'utf-8')
+    if (fs.existsSync(fullPath) && fs.statSync(fullPath).isFile()) {
+      return pathOnly ? fullPath : fs.readFileSync(fullPath, 'utf-8')
     }
   }
   const parentDir = path.dirname(dir)
   if (parentDir !== dir) {
-    return lookupFile(parentDir, formats)
+    return lookupFile(parentDir, formats, pathOnly)
+  }
+}
+
+/**
+ * Files under root are watched by default, but with user aliases we can still
+ * serve files out of root. Add such files to the watcher (if not node_modules)
+ */
+export function watchFileIfOutOfRoot(
+  watcher: HMRWatcher,
+  root: string,
+  file: string
+) {
+  if (!file.startsWith(root) && !/node_modules/.test(file)) {
+    watcher.add(file)
   }
 }
